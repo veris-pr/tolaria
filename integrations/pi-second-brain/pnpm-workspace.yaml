@@ -1,0 +1,6 @@
+# Standalone workspace: keeps this pi package isolated from the Tolaria app's
+# root pnpm workspace so its dependencies never leak into the app build.
+packages: []
+allowBuilds:
+  '@google/genai': false
+  protobufjs: false

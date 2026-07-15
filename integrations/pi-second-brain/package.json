@@ -1,0 +1,56 @@
+{
+  "name": "@tolaria/pi-second-brain",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Pi agent extension: a per-project, file-based second brain (diary, TIL, mistakes, bugs, decisions, dev/user docs) stored as a Tolaria-compatible markdown vault",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/tolaria-app/tolaria",
+    "directory": "integrations/pi-second-brain"
+  },
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "second-brain",
+    "agent-diary",
+    "markdown",
+    "tolaria"
+  ],
+  "main": "./src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "files": [
+    "src",
+    "skills",
+    "README.md",
+    "PORTENT.md"
+  ],
+  "pi": {
+    "extensions": [
+      "./src/entry.ts"
+    ],
+    "skills": [
+      "./skills"
+    ]
+  },
+  "scripts": {
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-ai": "^0.80.6",
+    "@earendil-works/pi-coding-agent": "^0.80.6",
+    "@types/node": "^25.9.2",
+    "typebox": "^1.2.3",
+    "typescript": "^6.0.3",
+    "vitest": "^4.1.7"
+  }
+}
