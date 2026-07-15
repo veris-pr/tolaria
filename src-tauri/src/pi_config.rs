@@ -1,8 +1,9 @@
 use crate::ai_agents::AiAgentPermissionMode;
 use crate::pi_cli::AgentStreamRequest;
 use serde_json::{Map, Value};
+use std::ffi::OsStr;
 use std::io::ErrorKind;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
 
 pub(crate) fn build_command(
@@ -101,10 +102,95 @@ fn copy_agent_entry(source: &Path, target: &Path) -> Result<(), String> {
     if metadata.is_dir() {
         seed_agent_dir(source, target)
     } else if metadata.is_file() {
-        copy_agent_file(source, target, metadata)
+        seed_agent_file(source, target, metadata)
     } else {
         Ok(())
     }
+}
+
+fn seed_agent_file(
+    source: &Path,
+    target: &Path,
+    metadata: std::fs::Metadata,
+) -> Result<(), String> {
+    match rewritten_settings(source)? {
+        Some(contents) => write_seeded_file(target, &contents, metadata),
+        None => copy_agent_file(source, target, metadata),
+    }
+}
+
+/// Pi resolves relative `packages` paths against the active agent dir, so a
+/// seeded copy must pin them to the source dir they were installed under.
+fn rewritten_settings(source: &Path) -> Result<Option<String>, String> {
+    if source.file_name() != Some(OsStr::new("settings.json")) {
+        return Ok(None);
+    }
+    let (Some(base), Ok(contents)) = (source.parent(), std::fs::read_to_string(source)) else {
+        return Ok(None);
+    };
+    let Ok(mut settings) = serde_json::from_str::<Value>(&contents) else {
+        return Ok(None);
+    };
+    if !rewrite_relative_packages(&mut settings, base) {
+        return Ok(None);
+    }
+    serde_json::to_string_pretty(&settings)
+        .map(Some)
+        .map_err(|error| format!("Failed to serialize seeded Pi settings: {error}"))
+}
+
+fn rewrite_relative_packages(settings: &mut Value, base: &Path) -> bool {
+    let Some(packages) = settings.get_mut("packages").and_then(Value::as_array_mut) else {
+        return false;
+    };
+    let mut changed = false;
+    for package in packages {
+        if let Some(absolute) = absolute_package_path(package, base) {
+            *package = Value::String(absolute);
+            changed = true;
+        }
+    }
+    changed
+}
+
+fn absolute_package_path(package: &Value, base: &Path) -> Option<String> {
+    let path = package.as_str().filter(|path| is_relative_path(path))?;
+    let absolute = lexically_normalized(&base.join(path));
+    Some(absolute.to_string_lossy().into_owned())
+}
+
+fn is_relative_path(package: &str) -> bool {
+    matches!(
+        Path::new(package).components().next(),
+        Some(Component::CurDir | Component::ParentDir)
+    )
+}
+
+fn lexically_normalized(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir if normalized.pop() => {}
+            component => normalized.push(component.as_os_str()),
+        }
+    }
+    normalized
+}
+
+fn write_seeded_file(
+    target: &Path,
+    contents: &str,
+    metadata: std::fs::Metadata,
+) -> Result<(), String> {
+    create_parent_dir(target)?;
+    std::fs::write(target, contents).map_err(|error| {
+        format!(
+            "Failed to write seeded Pi agent config at {}: {error}",
+            target.display()
+        )
+    })?;
+    preserve_permissions(target, metadata)
 }
 
 fn copy_agent_file(
@@ -112,25 +198,31 @@ fn copy_agent_file(
     target: &Path,
     metadata: std::fs::Metadata,
 ) -> Result<(), String> {
-    if let Some(parent) = target.parent() {
-        std::fs::create_dir_all(parent).map_err(|error| {
-            format!(
-                "Failed to create Pi agent config parent at {}: {error}",
-                parent.display()
-            )
-        })?;
-    }
+    create_parent_dir(target)?;
     match std::fs::copy(source, target) {
-        Ok(_) => {}
-        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
-        Err(error) => {
-            return Err(format!(
-                "Failed to copy Pi agent config from {} to {}: {error}",
-                source.display(),
-                target.display()
-            ));
-        }
+        Ok(_) => preserve_permissions(target, metadata),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!(
+            "Failed to copy Pi agent config from {} to {}: {error}",
+            source.display(),
+            target.display()
+        )),
     }
+}
+
+fn create_parent_dir(target: &Path) -> Result<(), String> {
+    let Some(parent) = target.parent() else {
+        return Ok(());
+    };
+    std::fs::create_dir_all(parent).map_err(|error| {
+        format!(
+            "Failed to create Pi agent config parent at {}: {error}",
+            parent.display()
+        )
+    })
+}
+
+fn preserve_permissions(target: &Path, metadata: std::fs::Metadata) -> Result<(), String> {
     std::fs::set_permissions(target, metadata.permissions()).map_err(|error| {
         format!(
             "Failed to preserve Pi agent config permissions at {}: {error}",
@@ -460,6 +552,56 @@ mod tests {
         assert_eq!(
             mcp["mcpServers"]["tolaria"]["env"]["VAULT_PATH"],
             "/tmp/vault"
+        );
+    }
+
+    #[test]
+    fn seeded_settings_rewrite_relative_packages_against_source_dir() {
+        let source_agent_dir = tempfile::tempdir().unwrap();
+        let agent_dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            source_agent_dir.path().join("settings.json"),
+            r#"{"defaultProvider":"openai","packages":["npm:pi-mcp-adapter","../plugins/local-plugin","./inline-plugin","git:example/repo"]}"#,
+        )
+        .unwrap();
+
+        seed_agent_dir(source_agent_dir.path(), agent_dir.path()).unwrap();
+
+        let seeded = read_seeded_settings(agent_dir.path());
+        assert_eq!(seeded["defaultProvider"], "openai");
+        assert_rewritten_packages(&seeded["packages"], source_agent_dir.path());
+    }
+
+    fn read_seeded_settings(agent_dir: &Path) -> serde_json::Value {
+        serde_json::from_str(&std::fs::read_to_string(agent_dir.join("settings.json")).unwrap())
+            .unwrap()
+    }
+
+    fn assert_rewritten_packages(packages: &serde_json::Value, source_dir: &Path) {
+        let sibling = source_dir.parent().unwrap().join("plugins/local-plugin");
+        let inline = source_dir.join("inline-plugin");
+        assert_eq!(
+            packages,
+            &serde_json::json!([
+                "npm:pi-mcp-adapter",
+                sibling.to_string_lossy(),
+                inline.to_string_lossy(),
+                "git:example/repo",
+            ])
+        );
+    }
+
+    #[test]
+    fn malformed_seeded_settings_are_copied_verbatim() {
+        let source_agent_dir = tempfile::tempdir().unwrap();
+        let agent_dir = tempfile::tempdir().unwrap();
+        std::fs::write(source_agent_dir.path().join("settings.json"), "not json{").unwrap();
+
+        seed_agent_dir(source_agent_dir.path(), agent_dir.path()).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(agent_dir.path().join("settings.json")).unwrap(),
+            "not json{"
         );
     }
 
